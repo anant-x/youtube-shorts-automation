@@ -1,5 +1,6 @@
 .env
 .env.*
+node_modules/
 __pycache__/
 *.py[cod]
 .venv/
@@ -9,6 +10,8 @@ voice.mp3
 short.mp4
 title.txt
 token.pickle
+token.json
+credentials.json
 client_secret.json
 *.mp4
 .DS_Store

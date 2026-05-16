@@ -1,16 +1,19 @@
-# One-time setup:
-# 1. Google Cloud Console: enable YouTube Data API v3, create OAuth 2.0 Desktop credentials.
-# 2. Run a local OAuth flow once to obtain token.pickle (google-auth-oauthlib installed):
-#      from google_auth_oauthlib.flow import InstalledAppFlow
-#      SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-#      flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
-#      creds = flow.run_local_server(port=0)
-#      pickle.dump(creds, open("token.pickle", "wb"))
-# 3. Base64-encode token.pickle for GitHub: base64 -i token.pickle | pbcopy
-# 4. Add GitHub secret GOOGLE_TOKEN with that base64 string.
-# 5. Locally, place token.pickle in this directory OR set GOOGLE_TOKEN env var.
+# One-time setup (YouTube Data API v3 + OAuth):
+# 1. Google Cloud Console → APIs → enable "YouTube Data API v3".
+# 2. Credentials → Create OAuth client ID → Desktop app → download JSON.
+# 3. Save the file as credentials.json in this folder.
+# 4. Run:  python uploader.py --authenticate
+#    (Browser opens; sign in and allow upload access.)
+# 5. token.json is created. For GitHub Actions, add secrets:
+#      GOOGLE_CREDENTIALS = base64 of credentials.json
+#      GOOGLE_TOKEN       = base64 of token.json
+#    macOS: base64 -i credentials.json | pbcopy
+#           base64 -i token.json | pbcopy
+# 6. Daily runs: python main.py && python uploader.py
 
+import argparse
 import base64
+import json
 import os
 import pickle
 import sys
@@ -19,11 +22,14 @@ from pathlib import Path
 WORK_DIR = Path(__file__).resolve().parent
 SHORT_PATH = WORK_DIR / "short.mp4"
 TITLE_PATH = WORK_DIR / "title.txt"
-TOKEN_PATH = WORK_DIR / "token.pickle"
+CREDENTIALS_PATH = WORK_DIR / "credentials.json"
+TOKEN_JSON_PATH = WORK_DIR / "token.json"
+TOKEN_PICKLE_PATH = WORK_DIR / "token.pickle"
 VOICE_PATH = WORK_DIR / "voice.mp3"
 CLIPS_DIR = WORK_DIR / "clips"
 
 DESCRIPTION = "Follow for daily facts!\n#shorts #facts #viral"
+SHORTS_TAGS = ["shorts", "facts", "viral", "youtubeshorts"]
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
@@ -31,55 +37,138 @@ def log(step: str, message: str) -> None:
     print(f"[{step}] {message}", flush=True)
 
 
-def load_token_pickle() -> None:
-    log("auth", "Loading YouTube OAuth token...")
-    if TOKEN_PATH.exists():
-        log("auth", f"Using existing {TOKEN_PATH}")
-        return
+def decode_secret_to_file(env_name: str, dest: Path, label: str) -> bool:
+    raw = os.environ.get(env_name)
+    if not raw:
+        return False
+    try:
+        dest.write_bytes(base64.b64decode(raw.strip()))
+        log("auth", f"Wrote {label} from {env_name} → {dest.name}")
+        return True
+    except Exception as exc:
+        raise RuntimeError(f"Failed to decode {env_name}: {exc}") from exc
 
-    token_b64 = os.environ.get("GOOGLE_TOKEN")
-    if not token_b64:
-        raise RuntimeError(
-            "No token.pickle found and GOOGLE_TOKEN env var is not set."
-        )
+
+def ensure_credentials_file() -> None:
+    log("auth", "Loading OAuth client credentials...")
+    if CREDENTIALS_PATH.exists():
+        log("auth", f"Using {CREDENTIALS_PATH}")
+        return
+    if decode_secret_to_file("GOOGLE_CREDENTIALS", CREDENTIALS_PATH, "credentials.json"):
+        return
+    if decode_secret_to_file("GOOGLE_CREDENTIALS_JSON", CREDENTIALS_PATH, "credentials.json"):
+        return
+    raise RuntimeError(
+        f"{CREDENTIALS_PATH} not found. Download OAuth Desktop credentials from "
+        "Google Cloud Console, save as credentials.json, or set GOOGLE_CREDENTIALS secret."
+    )
+
+
+def save_token_json(creds) -> None:
+    TOKEN_JSON_PATH.write_text(creds.to_json(), encoding="utf-8")
+    log("auth", f"Saved refreshed token to {TOKEN_JSON_PATH}")
+
+
+def load_token_pickle_creds():
+    from google.oauth2.credentials import Credentials
+
+    with open(TOKEN_PICKLE_PATH, "rb") as token_file:
+        creds = pickle.load(token_file)
+    if isinstance(creds, Credentials):
+        save_token_json(creds)
+        log("auth", "Migrated token.pickle → token.json")
+        return creds
+    raise RuntimeError("token.pickle format not recognized.")
+
+
+def ensure_token_file() -> None:
+    if TOKEN_JSON_PATH.exists():
+        log("auth", f"Using {TOKEN_JSON_PATH}")
+        return
+    if TOKEN_PICKLE_PATH.exists():
+        load_token_pickle_creds()
+        return
+    if decode_secret_to_file("GOOGLE_TOKEN", TOKEN_JSON_PATH, "token.json"):
+        return
+    if decode_secret_to_file("GOOGLE_TOKEN_JSON", TOKEN_JSON_PATH, "token.json"):
+        return
+    # Legacy: GOOGLE_TOKEN was base64 pickle
+    raw = os.environ.get("GOOGLE_TOKEN")
+    if raw:
+        try:
+            data = base64.b64decode(raw.strip())
+            if data[:1] in (b"{", b"["):
+                TOKEN_JSON_PATH.write_bytes(data)
+                log("auth", "Decoded GOOGLE_TOKEN (JSON) → token.json")
+                return
+            TOKEN_PICKLE_PATH.write_bytes(data)
+            log("auth", "Decoded legacy GOOGLE_TOKEN (pickle) → token.pickle")
+            load_token_pickle_creds()
+            return
+        except Exception as exc:
+            raise RuntimeError(f"Failed to decode GOOGLE_TOKEN: {exc}") from exc
+
+
+def get_credentials():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    ensure_credentials_file()
+    ensure_token_file()
 
     try:
-        token_bytes = base64.b64decode(token_b64.strip())
-        TOKEN_PATH.write_bytes(token_bytes)
-        log("auth", "Decoded GOOGLE_TOKEN secret into token.pickle")
+        creds = Credentials.from_authorized_user_file(str(TOKEN_JSON_PATH), YOUTUBE_SCOPES)
     except Exception as exc:
-        raise RuntimeError(f"Failed to decode GOOGLE_TOKEN: {exc}") from exc
+        raise RuntimeError(f"Failed to load token.json: {exc}") from exc
+
+    if creds.valid:
+        log("auth", "OAuth token is valid.")
+        return creds
+
+    if creds.expired and creds.refresh_token:
+        try:
+            log("auth", "Refreshing expired OAuth token...")
+            creds.refresh(Request())
+            save_token_json(creds)
+            log("auth", "Token refreshed successfully.")
+            return creds
+        except Exception as exc:
+            log("auth", f"Token refresh failed ({exc}).")
+
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+        raise RuntimeError(
+            "No valid YouTube token in CI. Run locally: python uploader.py --authenticate "
+            "then update the GOOGLE_TOKEN secret with base64 of token.json."
+        )
+
+    log("auth", "Starting browser OAuth flow (one-time)...")
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(CREDENTIALS_PATH),
+            YOUTUBE_SCOPES,
+        )
+        creds = flow.run_local_server(port=0, prompt="consent")
+        save_token_json(creds)
+        log("auth", "OAuth complete. token.json saved.")
+        return creds
+    except Exception as exc:
+        raise RuntimeError(f"OAuth flow failed: {exc}") from exc
 
 
 def get_youtube_service():
     try:
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
     except ImportError as exc:
         raise RuntimeError(
-            "google-api-python-client / google-auth not installed."
+            "Install dependencies: pip install -r requirements.txt"
         ) from exc
 
-    load_token_pickle()
-
+    creds = get_credentials()
     try:
-        with open(TOKEN_PATH, "rb") as token_file:
-            creds = pickle.load(token_file)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load token.pickle: {exc}") from exc
-
-    if hasattr(creds, "expired") and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            with open(TOKEN_PATH, "wb") as token_file:
-                pickle.dump(creds, token_file)
-            log("auth", "Refreshed expired OAuth token.")
-        except Exception as exc:
-            log("auth", f"Token refresh failed ({exc}); trying upload anyway.")
-
-    try:
-        return build("youtube", "v3", credentials=creds)
+        service = build("youtube", "v3", credentials=creds)
+        log("auth", "YouTube Data API v3 client ready.")
+        return service
     except Exception as exc:
         raise RuntimeError(f"Failed to build YouTube client: {exc}") from exc
 
@@ -100,17 +189,24 @@ def upload_short(youtube, title: str) -> str:
         raise RuntimeError(f"{SHORT_PATH} not found. Run main.py first.")
 
     video_title = f"{title} #Shorts"
-    log("upload", f"Uploading as: {video_title}")
+    if len(video_title) > 100:
+        video_title = f"{title[:90]} #Shorts"
+
+    log("upload", f"Uploading Short: {video_title}")
 
     body = {
         "snippet": {
             "title": video_title,
             "description": DESCRIPTION,
+            "tags": SHORTS_TAGS,
             "categoryId": "27",
+            "defaultLanguage": "en",
         },
         "status": {
             "privacyStatus": "public",
             "selfDeclaredMadeForKids": False,
+            "embeddable": True,
+            "license": "youtube",
         },
     }
 
@@ -137,9 +233,12 @@ def upload_short(youtube, title: str) -> str:
         video_id = response.get("id")
         if not video_id:
             raise RuntimeError("Upload succeeded but no video ID returned.")
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        log("upload", f"Upload complete: {url}")
-        return url
+
+        shorts_url = f"https://www.youtube.com/shorts/{video_id}"
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        log("upload", f"Upload complete: {shorts_url}")
+        log("upload", f"Watch URL: {watch_url}")
+        return video_id
     except Exception as exc:
         raise RuntimeError(f"YouTube upload failed: {exc}") from exc
 
@@ -177,7 +276,18 @@ def cleanup_temp_files() -> None:
     log("cleanup", f"Cleanup finished ({removed} items removed).")
 
 
-def main() -> int:
+def run_authenticate() -> int:
+    print("=== YouTube OAuth — credentials.json setup ===", flush=True)
+    try:
+        get_credentials()
+        log("done", "Authentication successful. token.json is ready for uploads.")
+        return 0
+    except Exception as exc:
+        log("error", str(exc))
+        return 1
+
+
+def run_upload() -> int:
     print("=== YouTube Shorts Uploader — starting ===", flush=True)
     try:
         youtube = get_youtube_service()
@@ -189,6 +299,19 @@ def main() -> int:
     except Exception as exc:
         log("error", str(exc))
         return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="YouTube Shorts OAuth and upload")
+    parser.add_argument(
+        "--authenticate",
+        action="store_true",
+        help="Run OAuth flow using credentials.json (creates token.json)",
+    )
+    args = parser.parse_args()
+    if args.authenticate:
+        return run_authenticate()
+    return run_upload()
 
 
 if __name__ == "__main__":

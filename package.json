@@ -1,0 +1,11 @@
+{
+  "name": "youtube-shorts-automation",
+  "private": true,
+  "scripts": {
+    "auth": "node upload.js --authenticate",
+    "upload": "node upload.js"
+  },
+  "dependencies": {
+    "googleapis": "^171.4.0"
+  }
+}

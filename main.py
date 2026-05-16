@@ -2,7 +2,7 @@
 # 1. Set GROQ_API_KEY and PEXELS_API_KEY in your environment (or GitHub Actions secrets).
 # 2. Use Python 3.11: pip install -r requirements.txt && install ffmpeg (apt/brew).
 # 3. Run locally: python main.py  (creates short.mp4 + title.txt).
-# 4. Configure YouTube OAuth separately — see uploader.py setup comment.
+# 4. YouTube OAuth: save credentials.json, run python uploader.py --authenticate (see uploader.py).
 
 import asyncio
 import os
