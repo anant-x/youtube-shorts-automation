@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+clips/
+voice.mp3
+short.mp4
+title.txt
+token.pickle
+client_secret.json
+*.mp4
+.DS_Store

@@ -1,0 +1,6 @@
+requests
+edge-tts
+moviepy
+pytrends
+google-api-python-client
+google-auth-oauthlib
