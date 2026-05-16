@@ -18,6 +18,7 @@ const SHORT_PATH = path.join(WORK_DIR, "short.mp4");
 const TITLE_PATH = path.join(WORK_DIR, "title.txt");
 
 const SCOPES = ["https://www.googleapis.com/auth/youtube.upload"];
+const REDIRECT_URI = "http://localhost:8080";
 const DESCRIPTION = "Follow for daily facts!\n#shorts #facts #viral";
 const SHORTS_TAGS = ["shorts", "facts", "viral", "youtubeshorts"];
 
@@ -60,7 +61,7 @@ function ensureTokenFile() {
   ) {
     return;
   }
-  throw new Error("token.json not found. Run: node upload.js --authenticate");
+  throw new Error("token.json not found. Run: node app.js --authenticate");
 }
 
 function loadOAuthClient() {
@@ -73,7 +74,7 @@ function loadOAuthClient() {
   return new google.auth.OAuth2(
     config.client_id,
     config.client_secret,
-    (config.redirect_uris && config.redirect_uris[0]) || "http://localhost"
+    REDIRECT_URI
   );
 }
 
@@ -82,6 +83,7 @@ async function authorizeInteractive(oauth2Client) {
     access_type: "offline",
     scope: SCOPES,
     prompt: "consent",
+    redirect_uri: REDIRECT_URI,
   });
 
   log("auth", "Open this URL in your browser:");
@@ -90,7 +92,7 @@ async function authorizeInteractive(oauth2Client) {
   const code = await new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       try {
-        const url = new URL(req.url, "http://localhost");
+        const url = new URL(req.url, REDIRECT_URI);
         const authCode = url.searchParams.get("code");
         if (authCode) {
           res.end("Authentication successful. You can close this tab.");
@@ -101,14 +103,17 @@ async function authorizeInteractive(oauth2Client) {
         reject(err);
       }
     });
-    server.listen(8080, () => log("auth", "Waiting for OAuth callback on http://localhost:8080"));
+    server.listen(8080, () => log("auth", `Waiting for OAuth callback on ${REDIRECT_URI}`));
     setTimeout(() => {
       server.close();
       reject(new Error("OAuth timed out after 120s"));
     }, 120000);
   });
 
-  const { tokens } = await oauth2Client.getToken(code);
+  const { tokens } = await oauth2Client.getToken({
+    code,
+    redirect_uri: REDIRECT_URI,
+  });
   oauth2Client.setCredentials(tokens);
   fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
   log("auth", `Saved token to ${TOKEN_PATH}`);
@@ -131,7 +136,7 @@ async function getAuthorizedClient() {
   } catch (err) {
     if (process.env.CI || process.env.GITHUB_ACTIONS) {
       throw new Error(
-        "Invalid token in CI. Run locally: node upload.js --authenticate"
+        "Invalid token in CI. Run locally: node app.js --authenticate"
       );
     }
     return authorizeInteractive(oauth2Client);

@@ -2,8 +2,9 @@
   "name": "youtube-shorts-automation",
   "private": true,
   "scripts": {
-    "auth": "node upload.js --authenticate",
-    "upload": "node upload.js"
+    "start": "node app.js",
+    "auth": "node app.js --authenticate",
+    "upload": "node app.js"
   },
   "dependencies": {
     "googleapis": "^171.4.0"
