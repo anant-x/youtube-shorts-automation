@@ -1,9 +1,9 @@
 # One-time setup (YouTube Data API v3 + OAuth):
 # 1. Google Cloud Console → APIs → enable "YouTube Data API v3".
-# 2. Credentials → Create OAuth client ID → Desktop app → download JSON.
-# 3. Save the file as credentials.json in this folder.
+# 2. Credentials → Create OAuth client ID → Desktop app (NOT Web) → download JSON.
+# 3. Save the file as credentials.json in this folder (must contain "installed" key).
 # 4. Run:  python uploader.py --authenticate
-#    (Browser opens; sign in and allow upload access.)
+#    Uses installed-app loopback (random localhost port). No redirect URIs to add in Console.
 # 5. token.json is created. For GitHub Actions, add secrets:
 #      GOOGLE_CREDENTIALS = base64 of credentials.json
 #      GOOGLE_TOKEN       = base64 of token.json
@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 
 WORK_DIR = Path(__file__).resolve().parent
-SHORT_PATH = WORK_DIR / "short.mp4"
+SHORT_PATH = WORK_DIR / "shorts.mp4"
+LEGACY_SHORT_PATH = WORK_DIR / "short.mp4"
 TITLE_PATH = WORK_DIR / "title.txt"
 CREDENTIALS_PATH = WORK_DIR / "credentials.json"
 TOKEN_JSON_PATH = WORK_DIR / "token.json"
@@ -49,14 +50,33 @@ def decode_secret_to_file(env_name: str, dest: Path, label: str) -> bool:
         raise RuntimeError(f"Failed to decode {env_name}: {exc}") from exc
 
 
+def load_installed_credentials() -> None:
+    """Ensure credentials.json exists and is a Desktop (installed) OAuth client."""
+    with open(CREDENTIALS_PATH, encoding="utf-8") as cred_file:
+        data = json.load(cred_file)
+    if data.get("web") and not data.get("installed"):
+        raise RuntimeError(
+            "credentials.json is a Web OAuth client. Create a Desktop application "
+            "OAuth client in Google Cloud Console and download the new JSON."
+        )
+    if not data.get("installed"):
+        raise RuntimeError(
+            "credentials.json must contain an 'installed' block (Desktop OAuth client)."
+        )
+    log("auth", "Using Google OAuth Desktop (installed application) client.")
+
+
 def ensure_credentials_file() -> None:
     log("auth", "Loading OAuth client credentials...")
     if CREDENTIALS_PATH.exists():
         log("auth", f"Using {CREDENTIALS_PATH}")
+        load_installed_credentials()
         return
     if decode_secret_to_file("GOOGLE_CREDENTIALS", CREDENTIALS_PATH, "credentials.json"):
+        load_installed_credentials()
         return
     if decode_secret_to_file("GOOGLE_CREDENTIALS_JSON", CREDENTIALS_PATH, "credentials.json"):
+        load_installed_credentials()
         return
     raise RuntimeError(
         f"{CREDENTIALS_PATH} not found. Download OAuth Desktop credentials from "
@@ -142,13 +162,18 @@ def get_credentials():
             "then update the GOOGLE_TOKEN secret with base64 of token.json."
         )
 
-    log("auth", "Starting browser OAuth flow (one-time)...")
+    log("auth", "Starting Desktop installed-app OAuth (loopback, no redirect URI setup)...")
     try:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(CREDENTIALS_PATH),
             YOUTUBE_SCOPES,
         )
-        creds = flow.run_local_server(port=0, prompt="consent")
+        creds = flow.run_local_server(
+            host="127.0.0.1",
+            port=0,
+            open_browser=True,
+            prompt="consent",
+        )
         save_token_json(creds)
         log("auth", "OAuth complete. token.json saved.")
         return creds
@@ -173,6 +198,17 @@ def get_youtube_service():
         raise RuntimeError(f"Failed to build YouTube client: {exc}") from exc
 
 
+def resolve_video_path() -> Path:
+    if SHORT_PATH.exists():
+        return SHORT_PATH
+    if LEGACY_SHORT_PATH.exists():
+        log("upload", f"Using legacy {LEGACY_SHORT_PATH.name}")
+        return LEGACY_SHORT_PATH
+    raise RuntimeError(
+        f"{SHORT_PATH.name} not found. Run main.py first to create the video."
+    )
+
+
 def read_title() -> str:
     if not TITLE_PATH.exists():
         raise RuntimeError(f"{TITLE_PATH} not found. Run main.py first.")
@@ -185,8 +221,8 @@ def read_title() -> str:
 def upload_short(youtube, title: str) -> str:
     from googleapiclient.http import MediaFileUpload
 
-    if not SHORT_PATH.exists():
-        raise RuntimeError(f"{SHORT_PATH} not found. Run main.py first.")
+    video_path = resolve_video_path()
+    log("upload", f"Video file: {video_path}")
 
     video_title = f"{title} #Shorts"
     if len(video_title) > 100:
@@ -212,7 +248,7 @@ def upload_short(youtube, title: str) -> str:
 
     try:
         media = MediaFileUpload(
-            str(SHORT_PATH),
+            str(video_path),
             mimetype="video/mp4",
             resumable=True,
             chunksize=1024 * 1024,
@@ -264,7 +300,7 @@ def cleanup_temp_files() -> None:
         except OSError:
             pass
 
-    for optional in (SHORT_PATH, TITLE_PATH):
+    for optional in (SHORT_PATH, LEGACY_SHORT_PATH, TITLE_PATH):
         if optional.exists():
             try:
                 optional.unlink()

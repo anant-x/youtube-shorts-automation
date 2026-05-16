@@ -1,12 +1,18 @@
 # One-time setup:
 # 1. Set GROQ_API_KEY and PEXELS_API_KEY in your environment (or GitHub Actions secrets).
 # 2. Use Python 3.11: pip install -r requirements.txt && install ffmpeg (apt/brew).
-# 3. Run locally: python main.py  (creates short.mp4 + title.txt).
+# 3. Run locally: python main.py  (creates shorts.mp4 + title.txt).
 # 4. YouTube OAuth: save credentials.json, run python uploader.py --authenticate (see uploader.py).
 
 import asyncio
 import os
 import random
+
+# Clear broken proxy vars so requests / edge-tts / pytrends can reach APIs
+for _proxy in (
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"
+):
+    os.environ.pop(_proxy, None)
 import re
 import sys
 from pathlib import Path
@@ -15,7 +21,7 @@ import edge_tts
 import requests
 
 WORK_DIR = Path(__file__).resolve().parent
-SHORT_PATH = WORK_DIR / "short.mp4"
+SHORT_PATH = WORK_DIR / "shorts.mp4"
 TITLE_PATH = WORK_DIR / "title.txt"
 VOICE_PATH = WORK_DIR / "voice.mp3"
 CLIPS_DIR = WORK_DIR / "clips"
@@ -248,9 +254,18 @@ def _import_moviepy():
 
         return AudioFileClip, VideoFileClip, concatenate_videoclips, 1
     except ImportError:
-        from moviepy import AudioFileClip, VideoFileClip, concatenate_videoclips
+        try:
+            from moviepy import AudioFileClip, VideoFileClip, concatenate_videoclips
 
-        return AudioFileClip, VideoFileClip, concatenate_videoclips, 2
+            return AudioFileClip, VideoFileClip, concatenate_videoclips, 2
+        except ImportError as exc:
+            raise RuntimeError(
+                "moviepy is not installed for this Python. Fix:\n"
+                "  rm -rf .venv\n"
+                "  /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv\n"
+                "  .venv/bin/pip install -r requirements.txt\n"
+                "  .venv/bin/python main.py"
+            ) from exc
 
 
 def _clip_resize(clip, *, height=None, width=None, version: int):
@@ -341,6 +356,11 @@ def assemble_video(clip_paths: list[Path], audio_path: Path, output_path: Path) 
             logger=None,
         )
         log("5", "Video export complete.")
+        if not output_path.is_file() or output_path.stat().st_size < 1000:
+            raise RuntimeError(
+                f"{output_path.name} was not created. Check ffmpeg is installed: brew install ffmpeg"
+            )
+        log("5", f"Verified {output_path.name} ({output_path.stat().st_size // 1024} KB).")
     except Exception as exc:
         raise RuntimeError(f"Video assembly failed: {exc}") from exc
     finally:
@@ -363,9 +383,44 @@ def save_title(topic: str) -> None:
     log("6", "Title saved.")
 
 
+def can_resume_assembly() -> bool:
+    return (
+        VOICE_PATH.is_file()
+        and any(CLIPS_DIR.glob("clip_*.mp4"))
+        and not SHORT_PATH.is_file()
+    )
+
+
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Create YouTube Short video")
+    parser.add_argument(
+        "--assemble-only",
+        action="store_true",
+        help="Skip APIs; build shorts.mp4 from existing voice.mp3 + clips/",
+    )
+    args = parser.parse_args()
+
     print("=== YouTube Shorts Creator — starting pipeline ===", flush=True)
     try:
+        if args.assemble_only or can_resume_assembly():
+            if not args.assemble_only and can_resume_assembly():
+                log("resume", "Found voice.mp3 + clips/ — assembling video only.")
+            clips = sorted(CLIPS_DIR.glob("clip_*.mp4"))
+            if not clips:
+                raise RuntimeError("No clips in clips/ folder.")
+            topic = (
+                TITLE_PATH.read_text(encoding="utf-8").strip()
+                if TITLE_PATH.exists()
+                else "Daily Facts"
+            )
+            assemble_video(clips, VOICE_PATH, SHORT_PATH)
+            if not TITLE_PATH.exists():
+                save_title(topic)
+            log("done", f"Created {SHORT_PATH}. Run: node app.js")
+            return 0
+
         topic = pick_trending_topic()
         script = generate_script(topic)
         print(f"[script] {script}\n", flush=True)
@@ -373,7 +428,7 @@ def main() -> int:
         clips = fetch_pexels_clips(topic)
         assemble_video(clips, VOICE_PATH, SHORT_PATH)
         save_title(topic)
-        log("done", f"Created {SHORT_PATH} and {TITLE_PATH}. Run uploader.py next.")
+        log("done", f"Created {SHORT_PATH} and {TITLE_PATH}. Run: node app.js")
         return 0
     except Exception as exc:
         log("error", str(exc))

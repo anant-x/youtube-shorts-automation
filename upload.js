@@ -1,26 +1,29 @@
 #!/usr/bin/env node
 /**
- * YouTube Shorts upload via googleapis + credentials.json (Node alternative).
- * Setup: place credentials.json, run `node upload.js --authenticate`, then upload.
+ * YouTube Shorts upload — Google OAuth Desktop (installed app) flow.
+ * Uses dynamic loopback (127.0.0.1:random port). No redirect URIs to add in Console.
  *
- * Env (GitHub Actions): GOOGLE_CREDENTIALS, GOOGLE_TOKEN (base64)
+ * Setup: credentials.json (Desktop client) → node app.js --authenticate
+ * CI: GOOGLE_CREDENTIALS + GOOGLE_TOKEN secrets (base64)
  */
 
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
+const { exec } = require("child_process");
 const { google } = require("googleapis");
 
 const WORK_DIR = __dirname;
 const CREDENTIALS_PATH = path.join(WORK_DIR, "credentials.json");
 const TOKEN_PATH = path.join(WORK_DIR, "token.json");
-const SHORT_PATH = path.join(WORK_DIR, "short.mp4");
+const SHORT_PATH = path.join(WORK_DIR, "shorts.mp4");
+const LEGACY_SHORT_PATH = path.join(WORK_DIR, "short.mp4");
 const TITLE_PATH = path.join(WORK_DIR, "title.txt");
 
 const SCOPES = ["https://www.googleapis.com/auth/youtube.upload"];
-const REDIRECT_URI = "http://localhost:8080";
 const DESCRIPTION = "Follow for daily facts!\n#shorts #facts #viral";
 const SHORTS_TAGS = ["shorts", "facts", "viral", "youtubeshorts"];
+const AUTH_TIMEOUT_MS = 180000;
 
 function log(step, message) {
   console.log(`[${step}] ${message}`);
@@ -46,7 +49,7 @@ function ensureCredentialsFile() {
     return;
   }
   throw new Error(
-    "credentials.json not found. Download OAuth Desktop JSON from Google Cloud Console."
+    "credentials.json not found. Download OAuth credentials for a Desktop application."
   );
 }
 
@@ -64,70 +67,142 @@ function ensureTokenFile() {
   throw new Error("token.json not found. Run: node app.js --authenticate");
 }
 
-function loadOAuthClient() {
+/** Desktop OAuth client from credentials.json (installed app, not web). */
+function loadInstalledConfig() {
   ensureCredentialsFile();
   const keys = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, "utf8"));
-  const config = keys.installed || keys.web;
-  if (!config) {
-    throw new Error("credentials.json must contain installed or web OAuth config.");
+
+  if (keys.web && !keys.installed) {
+    throw new Error(
+      "credentials.json is a Web client. Create an OAuth client of type " +
+        "'Desktop app' in Google Cloud Console and download the new JSON."
+    );
   }
+
+  const config = keys.installed;
+  if (!config || !config.client_id || !config.client_secret) {
+    throw new Error(
+      "credentials.json must contain an 'installed' Desktop OAuth block."
+    );
+  }
+
+  log("auth", "Using Google OAuth Desktop (installed application) client.");
+  return config;
+}
+
+function createOAuth2Client(config, redirectUri) {
   return new google.auth.OAuth2(
     config.client_id,
     config.client_secret,
-    REDIRECT_URI
+    redirectUri
   );
 }
 
-async function authorizeInteractive(oauth2Client) {
-  const authUrl = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: SCOPES,
-    prompt: "consent",
-    redirect_uri: REDIRECT_URI,
+function openBrowser(url) {
+  const cmd =
+    process.platform === "darwin"
+      ? `open "${url}"`
+      : process.platform === "win32"
+        ? `start "" "${url}"`
+        : `xdg-open "${url}"`;
+  exec(cmd, (err) => {
+    if (err) {
+      log("auth", "Could not open browser automatically — open the URL printed above.");
+    }
   });
+}
 
-  log("auth", "Open this URL in your browser:");
-  console.log(authUrl);
+/**
+ * Installed-app loopback flow (Google recommended for Desktop clients).
+ * 127.0.0.1 + ephemeral port — no manual redirect URI registration required.
+ */
+function authenticateInstalledApp() {
+  const config = loadInstalledConfig();
 
-  const code = await new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
+  return new Promise((resolve, reject) => {
+    let oauth2Client;
+    let redirectUri;
+    let timeoutId;
+
+    const server = http.createServer(async (req, res) => {
       try {
-        const url = new URL(req.url, REDIRECT_URI);
-        const authCode = url.searchParams.get("code");
-        if (authCode) {
-          res.end("Authentication successful. You can close this tab.");
+        const query = new URL(req.url || "/", "http://127.0.0.1").searchParams;
+
+        if (query.get("error")) {
+          res.end("Authentication failed. Return to the terminal.");
           server.close();
-          resolve(authCode);
+          reject(
+            new Error(
+              query.get("error_description") || query.get("error") || "OAuth denied"
+            )
+          );
+          return;
         }
+
+        const code = query.get("code");
+        if (!code) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+
+        res.end(
+          "<h2>Authentication successful</h2><p>You can close this tab.</p>"
+        );
+        clearTimeout(timeoutId);
+        server.close();
+
+        const { tokens } = await oauth2Client.getToken({ code, redirect_uri: redirectUri });
+        oauth2Client.setCredentials(tokens);
+        fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+        log("auth", `Saved token to ${TOKEN_PATH}`);
+        resolve(oauth2Client);
       } catch (err) {
+        server.close();
         reject(err);
       }
     });
-    server.listen(8080, () => log("auth", `Waiting for OAuth callback on ${REDIRECT_URI}`));
-    setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth timed out after 120s"));
-    }, 120000);
-  });
 
-  const { tokens } = await oauth2Client.getToken({
-    code,
-    redirect_uri: REDIRECT_URI,
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      redirectUri = `http://127.0.0.1:${port}`;
+      oauth2Client = createOAuth2Client(config, redirectUri);
+
+      const authUrl = oauth2Client.generateAuthUrl({
+        access_type: "offline",
+        scope: SCOPES,
+        prompt: "consent",
+      });
+
+      log(
+        "auth",
+        "Installed app OAuth — loopback redirect (no Console redirect URI setup)"
+      );
+      log("auth", `Listening on ${redirectUri}`);
+      openBrowser(authUrl);
+
+      timeoutId = setTimeout(() => {
+        server.close();
+        reject(new Error("OAuth timed out after 3 minutes."));
+      }, AUTH_TIMEOUT_MS);
+    });
+
+    server.on("error", reject);
   });
-  oauth2Client.setCredentials(tokens);
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
-  log("auth", `Saved token to ${TOKEN_PATH}`);
-  return oauth2Client;
 }
 
 async function getAuthorizedClient() {
-  const oauth2Client = loadOAuthClient();
+  const config = loadInstalledConfig();
   ensureTokenFile();
+
+  const redirectUri =
+    (config.redirect_uris && config.redirect_uris[0]) || "http://127.0.0.1";
+  const oauth2Client = createOAuth2Client(config, redirectUri);
   oauth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8")));
 
   try {
-    const token = await oauth2Client.getAccessToken();
-    if (!token || !token.token) {
+    const access = await oauth2Client.getAccessToken();
+    if (!access || !access.token) {
       throw new Error("No access token");
     }
     log("auth", "OAuth token is valid.");
@@ -139,7 +214,8 @@ async function getAuthorizedClient() {
         "Invalid token in CI. Run locally: node app.js --authenticate"
       );
     }
-    return authorizeInteractive(oauth2Client);
+    log("auth", `Token invalid (${err.message}); starting installed app flow...`);
+    return authenticateInstalledApp();
   }
 }
 
@@ -152,10 +228,18 @@ function readTitle() {
   return title;
 }
 
-async function uploadShort(auth) {
-  if (!fs.existsSync(SHORT_PATH)) {
-    throw new Error("short.mp4 not found. Run main.py first.");
+function resolveVideoPath() {
+  if (fs.existsSync(SHORT_PATH)) return SHORT_PATH;
+  if (fs.existsSync(LEGACY_SHORT_PATH)) {
+    log("upload", `Using legacy ${path.basename(LEGACY_SHORT_PATH)}`);
+    return LEGACY_SHORT_PATH;
   }
+  throw new Error("shorts.mp4 not found. Run: python main.py");
+}
+
+async function uploadShort(auth) {
+  const videoPath = resolveVideoPath();
+  log("upload", `Video file: ${videoPath}`);
 
   const topic = readTitle();
   let videoTitle = `${topic} #Shorts`;
@@ -182,7 +266,7 @@ async function uploadShort(auth) {
       },
     },
     media: {
-      body: fs.createReadStream(SHORT_PATH),
+      body: fs.createReadStream(videoPath),
     },
   });
 
@@ -196,9 +280,8 @@ async function main() {
 
   try {
     if (authenticate) {
-      console.log("=== YouTube OAuth (googleapis) ===");
-      const client = loadOAuthClient();
-      await authorizeInteractive(client);
+      console.log("=== YouTube OAuth — Desktop installed app ===");
+      await authenticateInstalledApp();
       log("done", "Authentication successful.");
       return;
     }

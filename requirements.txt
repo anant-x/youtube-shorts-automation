@@ -1,6 +1,7 @@
 requests
 edge-tts
 moviepy
+imageio-ffmpeg
 pytrends
 google-api-python-client
 google-auth-oauthlib
