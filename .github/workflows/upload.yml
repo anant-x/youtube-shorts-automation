@@ -44,17 +44,17 @@ jobs:
           test -n "$GOOGLE_CREDENTIALS" || { echo "::error::Missing GOOGLE_CREDENTIALS repository secret"; exit 1; }
           test -n "$GOOGLE_TOKEN" || { echo "::error::Missing GOOGLE_TOKEN repository secret"; exit 1; }
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS || secrets.GOOGLECRED }}
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN || secrets.GOOGLETOKEN }}
 
       - name: Create short video
         run: python main.py
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY || secrets.GROQ }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY || secrets.PEXEL }}
 
       - name: Upload to YouTube
         run: python uploader.py
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS || secrets.GOOGLECRED }}
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN || secrets.GOOGLETOKEN }}
