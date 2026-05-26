@@ -1,5 +1,5 @@
 # One-time setup:
-# 1. Set GROQ_API_KEY and PEXELS_API_KEY in your environment (or GitHub Actions secrets).
+# 1. Optionally set GROQ_API_KEY and PEXELS_API_KEY for AI script + stock clips.
 # 2. Use Python 3.11: pip install -r requirements.txt && install ffmpeg (apt/brew).
 # 3. Run locally: python main.py  (creates shorts.mp4 + title.txt).
 # 4. YouTube OAuth: save credentials.json, run python uploader.py --authenticate (see uploader.py).
@@ -100,7 +100,8 @@ def generate_script(topic: str) -> str:
     log("2", "Generating script with Groq API...")
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY environment variable is not set.")
+        log("2", "GROQ_API_KEY is not set; using built-in script fallback.")
+        return fallback_script(topic)
 
     prompt = (
         f"Write a YouTube Shorts voiceover script about: {topic}\n\n"
@@ -144,6 +145,10 @@ def generate_script(topic: str) -> str:
             log("2", f"Groq model {model} failed ({exc}).")
 
     log("2", f"All Groq models failed ({last_error}); using fallback script.")
+    return fallback_script(topic)
+
+
+def fallback_script(topic: str) -> str:
     return (
         f"Stop scrolling. {topic} will change how you see the world. "
         "Most people never learn this, but the evidence is everywhere once you notice. "
@@ -178,7 +183,8 @@ def fetch_pexels_clips(topic: str) -> list[Path]:
     log("4", "Fetching portrait stock clips from Pexels...")
     api_key = os.environ.get("PEXELS_API_KEY")
     if not api_key:
-        raise RuntimeError("PEXELS_API_KEY environment variable is not set.")
+        log("4", "PEXELS_API_KEY is not set; generating local fallback clips.")
+        return create_fallback_clips(topic)
 
     CLIPS_DIR.mkdir(exist_ok=True)
     query = topic_keywords(topic)
@@ -214,10 +220,12 @@ def fetch_pexels_clips(topic: str) -> list[Path]:
             response.raise_for_status()
             videos = response.json().get("videos", [])
         except Exception as retry_exc:
-            raise RuntimeError(f"Pexels API failed: {retry_exc}") from retry_exc
+            log("4", f"Pexels API failed ({retry_exc}); generating fallback clips.")
+            return create_fallback_clips(topic)
 
     if not videos:
-        raise RuntimeError("Pexels returned no portrait videos for this topic.")
+        log("4", "Pexels returned no portrait videos; generating fallback clips.")
+        return create_fallback_clips(topic)
 
     for index, video in enumerate(videos[:PEXELS_CLIP_COUNT]):
         files = video.get("video_files", [])
@@ -244,7 +252,8 @@ def fetch_pexels_clips(topic: str) -> list[Path]:
             log("4", f"Failed to download clip {index}: {exc}")
 
     if not downloaded:
-        raise RuntimeError("Could not download any Pexels clips.")
+        log("4", "Could not download Pexels clips; generating fallback clips.")
+        return create_fallback_clips(topic)
     return downloaded
 
 
@@ -266,6 +275,56 @@ def _import_moviepy():
                 "  .venv/bin/pip install -r requirements.txt\n"
                 "  .venv/bin/python main.py"
             ) from exc
+
+
+def _import_color_clip():
+    try:
+        from moviepy.editor import ColorClip
+
+        return ColorClip
+    except ImportError:
+        try:
+            from moviepy import ColorClip
+
+            return ColorClip
+        except ImportError as exc:
+            raise RuntimeError("moviepy ColorClip is not available.") from exc
+
+
+def create_fallback_clips(topic: str) -> list[Path]:
+    log("4", f"Creating generated fallback clips for: {topic}")
+    ColorClip = _import_color_clip()
+    CLIPS_DIR.mkdir(exist_ok=True)
+    colors = [
+        (18, 35, 46),
+        (38, 70, 83),
+        (42, 157, 143),
+        (233, 196, 106),
+        (231, 111, 81),
+    ]
+    generated: list[Path] = []
+
+    for index, color in enumerate(colors[:PEXELS_CLIP_COUNT]):
+        dest = CLIPS_DIR / f"generated_{index}.mp4"
+        clip = ColorClip(size=(TARGET_W, TARGET_H), color=color, duration=8)
+        try:
+            clip.write_videofile(
+                str(dest),
+                fps=FPS,
+                codec="libx264",
+                audio=False,
+                preset="ultrafast",
+                threads=2,
+                logger=None,
+            )
+            generated.append(dest)
+            log("4", f"Generated fallback clip {index + 1}: {dest.name}")
+        finally:
+            clip.close()
+
+    if not generated:
+        raise RuntimeError("Could not create fallback clips.")
+    return generated
 
 
 def _clip_resize(clip, *, height=None, width=None, version: int):
