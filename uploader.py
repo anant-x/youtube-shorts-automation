@@ -50,6 +50,16 @@ def decode_secret_to_file(env_name: str, dest: Path, label: str) -> bool:
         raise RuntimeError(f"Failed to decode {env_name}: {exc}") from exc
 
 
+def decode_base64_secret(env_name: str):
+    raw = os.environ.get(env_name)
+    if not raw:
+        return None
+    try:
+        return base64.b64decode(raw.strip())
+    except Exception as exc:
+        raise RuntimeError(f"Failed to decode {env_name}: {exc}") from exc
+
+
 def load_installed_credentials() -> None:
     """Ensure credentials.json exists and is a Desktop (installed) OAuth client."""
     with open(CREDENTIALS_PATH, encoding="utf-8") as cred_file:
@@ -64,6 +74,12 @@ def load_installed_credentials() -> None:
             "credentials.json must contain an 'installed' block (Desktop OAuth client)."
         )
     log("auth", "Using Google OAuth Desktop (installed application) client.")
+
+
+def get_installed_config() -> dict:
+    with open(CREDENTIALS_PATH, encoding="utf-8") as cred_file:
+        data = json.load(cred_file)
+    return data["installed"]
 
 
 def ensure_credentials_file() -> None:
@@ -101,6 +117,22 @@ def load_token_pickle_creds():
     raise RuntimeError("token.pickle format not recognized.")
 
 
+def write_token_secret(env_name: str) -> bool:
+    data = decode_base64_secret(env_name)
+    if data is None:
+        return False
+
+    if data.lstrip()[:1] in (b"{", b"["):
+        TOKEN_JSON_PATH.write_bytes(data)
+        log("auth", f"Wrote token.json from {env_name}")
+        return True
+
+    TOKEN_PICKLE_PATH.write_bytes(data)
+    log("auth", f"Wrote legacy token.pickle from {env_name}")
+    load_token_pickle_creds()
+    return True
+
+
 def ensure_token_file() -> None:
     if TOKEN_JSON_PATH.exists():
         log("auth", f"Using {TOKEN_JSON_PATH}")
@@ -108,39 +140,49 @@ def ensure_token_file() -> None:
     if TOKEN_PICKLE_PATH.exists():
         load_token_pickle_creds()
         return
-    if decode_secret_to_file("GOOGLE_TOKEN", TOKEN_JSON_PATH, "token.json"):
+    if write_token_secret("GOOGLE_TOKEN"):
         return
-    if decode_secret_to_file("GOOGLE_TOKEN_JSON", TOKEN_JSON_PATH, "token.json"):
+    if write_token_secret("GOOGLE_TOKEN_JSON"):
         return
-    # Legacy: GOOGLE_TOKEN was base64 pickle
-    raw = os.environ.get("GOOGLE_TOKEN")
-    if raw:
-        try:
-            data = base64.b64decode(raw.strip())
-            if data[:1] in (b"{", b"["):
-                TOKEN_JSON_PATH.write_bytes(data)
-                log("auth", "Decoded GOOGLE_TOKEN (JSON) → token.json")
-                return
-            TOKEN_PICKLE_PATH.write_bytes(data)
-            log("auth", "Decoded legacy GOOGLE_TOKEN (pickle) → token.pickle")
-            load_token_pickle_creds()
-            return
-        except Exception as exc:
-            raise RuntimeError(f"Failed to decode GOOGLE_TOKEN: {exc}") from exc
+
+
+def load_authorized_user_credentials(scopes: list[str]):
+    from google.oauth2.credentials import Credentials
+
+    try:
+        token_info = json.loads(TOKEN_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load token.json: {exc}") from exc
+
+    installed = get_installed_config()
+    changed = False
+    for token_key, installed_key in (
+        ("client_id", "client_id"),
+        ("client_secret", "client_secret"),
+        ("token_uri", "token_uri"),
+    ):
+        if not token_info.get(token_key) and installed.get(installed_key):
+            token_info[token_key] = installed[installed_key]
+            changed = True
+
+    if changed:
+        TOKEN_JSON_PATH.write_text(json.dumps(token_info, indent=2), encoding="utf-8")
+        log("auth", "Added OAuth client metadata to token.json")
+
+    try:
+        return Credentials.from_authorized_user_info(token_info, scopes)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load token.json: {exc}") from exc
 
 
 def get_credentials():
     from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     ensure_credentials_file()
     ensure_token_file()
 
-    try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_JSON_PATH), YOUTUBE_SCOPES)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load token.json: {exc}") from exc
+    creds = load_authorized_user_credentials(YOUTUBE_SCOPES)
 
     if creds.valid:
         log("auth", "OAuth token is valid.")
