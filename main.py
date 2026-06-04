@@ -14,6 +14,7 @@ for _proxy in (
 ):
     os.environ.pop(_proxy, None)
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -165,13 +166,53 @@ async def _synthesize_voice_async(script: str, output_path: Path, voice: str) ->
 
 def text_to_speech(script: str) -> Path:
     log("3", "Converting script to speech with edge-tts...")
-    voice = random.choice(MALE_VOICES)
+    voices = random.sample(MALE_VOICES, k=len(MALE_VOICES))
+    last_error = None
+    for voice in voices:
+        try:
+            asyncio.run(_synthesize_voice_async(script, VOICE_PATH, voice))
+            if VOICE_PATH.is_file() and VOICE_PATH.stat().st_size > 1000:
+                log("3", f"Voice saved to {VOICE_PATH} ({voice}, rate +15%).")
+                return VOICE_PATH
+            last_error = RuntimeError("edge-tts created an empty audio file")
+        except Exception as exc:
+            last_error = exc
+            log("3", f"edge-tts voice {voice} failed ({exc}).")
+
+    log("3", f"All edge-tts voices failed ({last_error}); generating fallback audio.")
+    return create_fallback_audio(script)
+
+
+def estimate_audio_duration(script: str) -> float:
+    words = max(len(script.split()), 1)
+    return max(12.0, min(60.0, words / 2.6))
+
+
+def create_fallback_audio(script: str) -> Path:
+    duration = estimate_audio_duration(script)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=44100:cl=mono",
+        "-t",
+        f"{duration:.2f}",
+        "-q:a",
+        "9",
+        "-acodec",
+        "libmp3lame",
+        str(VOICE_PATH),
+    ]
     try:
-        asyncio.run(_synthesize_voice_async(script, VOICE_PATH, voice))
-        log("3", f"Voice saved to {VOICE_PATH} ({voice}, rate +15%).")
-        return VOICE_PATH
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
-        raise RuntimeError(f"edge-tts failed: {exc}") from exc
+        raise RuntimeError(f"Fallback audio generation failed: {exc}") from exc
+    if not VOICE_PATH.is_file() or VOICE_PATH.stat().st_size < 1000:
+        raise RuntimeError("Fallback audio was not created.")
+    log("3", f"Fallback audio saved to {VOICE_PATH} ({duration:.1f}s).")
+    return VOICE_PATH
 
 
 def topic_keywords(topic: str) -> str:
